@@ -1,0 +1,8 @@
+# Supply-chain hardening
+# Refuse any package version published less than 30 days ago (minutes).
+minimumReleaseAge: 43200
+# Never run dependency install scripts unless explicitly allowlisted here.
+onlyBuiltDependencies: []
+strictDepBuilds: true
+# Refuse transitive deps from git/tarball URLs.
+blockExoticSubdeps: true

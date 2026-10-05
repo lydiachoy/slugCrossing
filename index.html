@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Slug Crossing</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+    <div id="hud">
+      <div class="stat"><b>Score</b> <span id="score">0</span></div>
+      <div class="stat"><b>Level</b> <span id="level">1</span></div>
+      <div class="stat"><b>Slugs</b> <span id="lives"></span></div>
+      <div class="stat" id="veg-stat" hidden><b>Veggies</b> <span id="veg">0</span></div>
+      <div class="stat moist" id="moist-stat"><b>Moisture</b> <span class="bar"><span id="moisture"></span></span></div>
+      <div class="stat slow" id="slowmo"></div>
+    </div>
+    <button id="skip" title="Skip to the next checkpoint" hidden>Skip ⏭</button>
+    <div id="tint"></div>
+    <div id="toast" hidden></div>
+    <div id="mash" hidden>
+      <div class="mash-title">A BIRD HAS YOU!</div>
+      <div class="mash-cta"><span class="keyboard">MASH <kbd>SPACE</kbd>!</span><span class="touch">TAP TAP TAP!</span></div>
+      <div class="mash-bar"><span id="mash-fill"></span></div>
+      <div class="mash-clock"><span id="mash-time"></span></div>
+    </div>
+    <div id="panel">
+      <div class="card">
+        <h1>Slug Crossing</h1>
+        <p id="panel-text">
+          Get the slug to the lettuce. The traffic is <em>very</em> fast. The slug is not.<br />
+          Watch for the <span class="warn">orange arrows</span> — a car is about to come through that lane.<br />
+          Asphalt dries a slug out; grass soaks it back up.<br />
+          Make it to the middle strip and that's where your next slug starts.<br />
+          The first road has a traffic light: on red the cars stop at the crosswalk… for a while.<br />
+          You have unlimited slugs. Other slugs want the lettuce too — beat them to it.<br />
+          Grab the <b>hourglass</b> for slow-mo. Beware the <b>salt truck</b>!<br />
+          If a <b>bird</b> grabs you, mash <kbd>Space</kbd> to break free!
+        </p>
+        <p class="keys">Hold <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> to crawl · <kbd>M</kbd> music · <kbd>N</kbd> sound effects</p>
+        <button id="start">Start crawling</button>
+      </div>
+    </div>
+    <div id="pad" aria-hidden="true">
+      <button data-dir="up">▲</button>
+      <button data-dir="left">◀</button>
+      <button data-dir="right">▶</button>
+      <button data-dir="down">▼</button>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
