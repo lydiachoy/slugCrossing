@@ -12,7 +12,10 @@ const SNAIL_R = 0.28;
 export const SNAIL_SPEED = 1.1;
 export const EAT_TIME = 1.4; // seconds of chewing to finish a vegetable
 const BITE_EVERY = 0.35;
-export const REGROW_TIME = 25;
+/** Clearing the garden: the gardener throws a tantrum, then the snail gets its trophy… */
+export const UPSET_TIME = 3.2; // seconds of tantrum before the trophy
+export const PORTAL_AT = UPSET_TIME + 3.5; // …and then a portal from hell opens beneath it
+export const CLEAR_BONUS = 2000;
 export const VISION_RANGE = 4.6;
 export const VISION_HALF = 0.62; // radians either side of where he's looking
 const WANDER_SPEED = 1.1;
@@ -38,10 +41,8 @@ export interface Veg {
   x: number;
   y: number;
   r: number;
-  /** 0 … 1 of the way through being eaten. */
+  /** 0 … 1 of the way through being eaten (gone for good at 1). */
   eaten: number;
-  /** Seconds until it grows back, once fully eaten. */
-  regrow: number;
 }
 export interface Flower {
   x: number;
@@ -55,7 +56,7 @@ export interface Gardener {
   heading: number;
   /** Where his eyes are pointed: the vision cone's centre line. */
   gaze: number;
-  state: 'wander' | 'pause' | 'alert' | 'chase' | 'carry' | 'throw';
+  state: 'wander' | 'pause' | 'alert' | 'chase' | 'carry' | 'throw' | 'upset';
   t: number;
   tx: number;
   ty: number;
@@ -66,7 +67,9 @@ export interface Gardener {
 export type GardenEvent =
   | { type: 'vegBite' }
   | { type: 'vegEaten'; kind: VegKind; value: number }
-  | { type: 'vegRegrow'; id: number }
+  | { type: 'gardenCleared' }
+  | { type: 'trophy' }
+  | { type: 'portal' }
   | { type: 'spotted' }
   | { type: 'caught' }
   | { type: 'thrown' }
@@ -86,8 +89,8 @@ export class Garden {
   veg: Veg[] = [];
   flowers: Flower[] = [];
   gardener: Gardener;
-  /** What's happening to the snail: free to roam, in the gardener's hand, or flying. */
-  phase: 'free' | 'caught' | 'thrown' = 'free';
+  /** What's happening to the snail: free to roam, in the gardener's hand, flying, or victorious. */
+  phase: 'free' | 'caught' | 'thrown' | 'won' = 'free';
   phaseT = 0;
   /** The snail's height off the ground (when held or thrown). */
   z = 0;
@@ -115,7 +118,7 @@ export class Garden {
       const y = GARDEN_Y0 + 1.4 + this.rng() * (GARDEN_Y1 - GARDEN_Y0 - 1.8);
       const clear = this.rocks.every((o) => Math.hypot(o.x - x, o.y - y) > o.r + r + 0.35)
         && this.veg.every((o) => Math.hypot(o.x - x, o.y - y) > o.r + r + 0.5);
-      if (clear) this.veg.push({ id: id++, kind, x, y, r, eaten: 0, regrow: 0 });
+      if (clear) this.veg.push({ id: id++, kind, x, y, r, eaten: 0 });
     }
     // Flowers everywhere else (just for looks).
     const petals = [0xff5d8f, 0xffd23f, 0xffffff, 0xb57bff, 0xff8c42, 0x5ec8ff];
@@ -171,11 +174,18 @@ export class Garden {
 
   update(dt: number, input: Dir | null, snail: SnailLike, events: GardenEvent[]): void {
     this.time += dt;
+    const before = this.phaseT;
     this.phaseT += dt;
-    for (const v of this.veg) {
-      if (v.eaten < 1 || (v.regrow -= dt) > 0) continue;
-      v.eaten = 0;
-      events.push({ type: 'vegRegrow', id: v.id });
+    if (this.phase === 'won') {
+      // The gardener stamps about; then it's trophy time; then the victory screen.
+      const g = this.gardener;
+      g.t += dt;
+      g.heading = g.gaze = Math.atan2(snail.y - g.y, snail.x - g.x);
+      snail.moving = false;
+      snail.facing = 'down';
+      if (before < UPSET_TIME && this.phaseT >= UPSET_TIME) events.push({ type: 'trophy' });
+      if (before < PORTAL_AT && this.phaseT >= PORTAL_AT) events.push({ type: 'portal' });
+      return;
     }
     this.stepSnail(dt, input, snail, events);
     this.stepGardener(dt, snail, events);
@@ -227,9 +237,9 @@ export class Garden {
         events.push({ type: 'vegBite' });
       }
       if (v.eaten >= 1) {
-        v.regrow = REGROW_TIME;
         this.eatenCount++;
         events.push({ type: 'vegEaten', kind: v.kind, value: VEG_VALUE[v.kind] });
+        if (this.veg.every((q) => q.eaten >= 1)) this.win(events); // every last vegetable: cleared!
       }
     } else this.biteT = 0;
   }
@@ -302,6 +312,20 @@ export class Garden {
     } else if (g.state === 'throw' && g.t >= 1) {
       this.pickTarget();
     }
+  }
+
+  /** The skip button: every vegetable gone at once, straight to the finale. */
+  clearAll(events: GardenEvent[]): void {
+    if (this.phase !== 'free') return;
+    for (const v of this.veg) v.eaten = 1;
+    this.win(events);
+  }
+
+  private win(events: GardenEvent[]): void {
+    this.phase = 'won';
+    this.phaseT = 0;
+    Object.assign(this.gardener, { state: 'upset', t: 0 });
+    events.push({ type: 'gardenCleared' });
   }
 
   /** The far side of the rock nearest (x, y), from the gardener's point of view. */

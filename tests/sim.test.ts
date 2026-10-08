@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import {
   CROSSWALK_HALF, DEATH_TIME, DUMP_EVERY, GOAL_ROW, GREEN_TIME, Game, HALF_W, LIVES, MUNCH_TIME, RED_TIME, SALT_LIFE,
   SLOTS, SLOWMO_TIME, SLOW_TRAFFIC, SLUG_SPEED, VEHICLE_LEN, WARN_TIME, type Npc,
-  BIRD_CARRY, BIRD_DIVE, BIRD_EVERY, MASH_TIME, ASCEND_TIME, SHELL_FALL, SNAIL_BONUS,
+  BIRD_CARRY, BIRD_DIVE, BIRD_EVERY, MASH_TIME, ASCEND_TIME, SHELL_FALL, SNAIL_BONUS, PORTAL_MORPH, PORTAL_TIME,
   type Dir, type GameEvent, type Vehicle, type VehicleKind,
 } from '../src/sim.ts';
-import { GARDEN_START } from '../src/garden.ts';
+import { GARDEN_START, Garden } from '../src/garden.ts';
+import { Underground } from '../src/underground.ts';
 
 const STEP = 1 / 120;
 
@@ -338,12 +339,15 @@ test('a ding for every lane crossed, once each', () => {
   assert.equal(run(g, 0.5, 'up').filter((e) => e.type === 'lane').length, 0, 'no repeat dings');
 });
 
-test('reaching the median puts a slow-mo power-up on the second road', () => {
+test('reaching the median puts two slow-mo power-ups on the second road', () => {
   const g = emptyRoad();
   const events = run(g, 5.6, 'up');
-  const spawned = events.find((e) => e.type === 'powerup');
-  assert.ok(spawned && spawned.type === 'powerup' && spawned.kind === 'slow');
-  assert.ok(spawned.y >= 6 && spawned.y <= 9 && Math.abs(spawned.x) < HALF_W);
+  const spawned = events.filter((e) => e.type === 'powerup');
+  assert.equal(spawned.length, 2);
+  assert.equal(g.powerups.filter((p) => p.kind === 'slow').length, 2);
+  for (const p of g.powerups) assert.ok(p.kind === 'slow' && p.y >= 6 && p.y <= 9 && Math.abs(p.x) < HALF_W);
+  const [a, b] = g.powerups;
+  assert.ok(a.y !== b.y || Math.abs(a.x - b.x) >= 1.5, 'not on top of each other');
 });
 
 test('slow-mo: traffic crawls, the slug doubles its speed, then back to normal after 8 s', () => {
@@ -538,7 +542,7 @@ test('spacebar does nothing when no bird has you', () => {
 
 // ---- the skip button ------------------------------------------------------------
 
-test('skip: start → median → lettuce, and not while something else is going on', () => {
+test('skip on the road: start → median → lettuce, then through the munch', () => {
   const g = emptyRoad();
   g.slug.x = 2.4;
   g.slug.y = 1.3;
@@ -549,5 +553,108 @@ test('skip: start → median → lettuce, and not while something else is going 
   const second = g.skip();
   assert.ok(second.some((e) => e.type === 'munch' && e.slot === 3), 'into the nearest free patch');
   assert.equal(g.state, 'munching');
-  assert.deepEqual(g.skip(), [], 'no skipping mid-munch');
+  g.skip(); // and skip the munch itself
+  run(g, STEP);
+  assert.equal(g.state, 'playing');
+  assert.ok(g.slug.y < 0.1, 'the next slug, back at the start');
+});
+
+// ---- the portal from hell ---------------------------------------------------------
+
+test('after the trophy, a portal opens: the snail becomes a worm and goes underground', async () => {
+  const { PORTAL_AT } = await import('../src/garden.ts');
+  const g = emptyRoad();
+  g.filled = [true, true, true, true, false];
+  g.slug.x = SLOTS[4];
+  g.slug.y = GOAL_ROW - 0.6;
+  run(g, 0.2 + MUNCH_TIME + ASCEND_TIME + 0.1, 'up');
+  assert.equal(g.state, 'garden');
+  const garden = g.garden!;
+  for (const v of garden.veg.slice(1)) v.eaten = 1;
+  const last = garden.veg[0];
+  Object.assign(g.slug, { x: last.x, y: last.y - last.r - 0.2 });
+  Object.assign(garden.gardener, { x: -7, y: garden.gardener.y, gaze: Math.PI, heading: Math.PI, state: 'pause', t: -1e9 });
+  const events = run(g, 0.3, 'up'); // onto the last vegetable…
+  events.push(...run(g, 2 + PORTAL_AT)); // …and stay there to eat it
+  assert.ok(events.some((e) => e.type === 'portal'));
+  assert.equal(g.state, 'portal');
+  assert.ok(g.underground);
+  const morph = run(g, PORTAL_MORPH + 0.05);
+  assert.ok(morph.some((e) => e.type === 'wormMorph'));
+  assert.ok(g.isWorm && !g.isSnail);
+  const under = run(g, PORTAL_TIME);
+  assert.ok(under.some((e) => e.type === 'underground'));
+  assert.equal(g.state, 'underground');
+  const score = g.score;
+  run(g, 1, 'down');
+  assert.ok(g.score > score, 'points for digging');
+});
+
+test('skip works in every mode: road → lettuce → ascension → garden → finale → underground', () => {
+  const g = emptyRoad();
+  g.filled = [true, true, true, true, false];
+  g.skip(); // start → median
+  assert.equal(g.slug.y, 5);
+  g.skip(); // median → the last lettuce
+  assert.equal(g.state, 'munching');
+  g.skip(); // finish the munch…
+  run(g, STEP);
+  assert.equal(g.state, 'ascending', '…and up goes the shell');
+  const before = g.score;
+  const toGarden = g.skip();
+  assert.equal(g.state, 'garden');
+  assert.ok(toGarden.some((e) => e.type === 'shellLands') && g.score === before + SNAIL_BONUS, 'still a snail, with its bonus');
+  assert.ok(Math.abs(g.slug.y - GARDEN_START.y) < 1e-9);
+  const cleared = g.skip();
+  assert.ok(cleared.some((e) => e.type === 'gardenCleared'));
+  assert.equal(g.garden!.phase, 'won');
+  assert.ok(g.garden!.veg.every((v) => v.eaten === 1));
+  assert.ok(g.canSkip, 'the finale can be skipped too');
+  const down = g.skip();
+  assert.ok(down.some((e) => e.type === 'underground'));
+  assert.equal(g.state, 'underground');
+  assert.ok(g.underground);
+  const banana = g.skip(); // worm: straight to the banana…
+  assert.ok(banana.some((e) => e.type === 'bananaFound'));
+  const up = g.skip(); // …then straight up to the tree
+  assert.ok(up.some((e) => e.type === 'treeStart'));
+  assert.equal(g.state, 'tree');
+  const cocoon = g.skip(); // caterpillar: straight to the sparkles…
+  assert.ok(cocoon.some((e) => e.type === 'cocoon'));
+  const fly = g.skip(); // …and then straight out of the cocoon…
+  assert.ok(fly.some((e) => e.type === 'emerge'));
+  const gust = g.skip(); // …into the gust of wind…
+  assert.ok(gust.some((e) => e.type === 'gust'));
+  const city = g.skip(); // …and away to the city
+  assert.ok(city.some((e) => e.type === 'cityStart'));
+  assert.equal(g.state, 'city');
+  const park = g.skip(); // city: straight off to the park…
+  assert.ok(park.some((e) => e.type === 'cityWin'));
+  const land = g.skip(); // …and straight into the trophy
+  assert.ok(land.some((e) => e.type === 'landTrophy'));
+  assert.equal(g.hasNextCheckpoint, false, 'nothing after landing in the trophy');
+  assert.deepEqual(g.skip(), []);
+});
+
+test('the worm surfacing starts the tree', () => {
+  const g = emptyRoad();
+  g.state = 'underground';
+  g.underground = new Underground(1);
+  g.underground.skipToBanana([]);
+  const events = run(g, 12);
+  assert.ok(events.some((e) => e.type === 'surfaced'));
+  assert.ok(events.some((e) => e.type === 'treeStart'));
+  assert.equal(g.state, 'tree');
+  assert.ok(g.tree);
+});
+
+test('no skipping while the gardener has hold of you', () => {
+  const g = emptyRoad();
+  g.state = 'garden';
+  g.garden = new Garden(1);
+  g.garden.phase = 'caught';
+  assert.equal(g.canSkip, false);
+  assert.deepEqual(g.skip(), []);
+  g.garden.phase = 'free';
+  assert.equal(g.canSkip, true);
 });

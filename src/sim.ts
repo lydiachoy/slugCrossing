@@ -1,8 +1,11 @@
-// Slug Crossing: the game rules, with no rendering, so they can be tested headless.
+// Slugger: the game rules, with no rendering, so they can be tested headless.
 // Coordinates: x runs left→right across the road (0 is the middle), y runs from the
 // start verge (row 0) up to the lettuce patch (GOAL_ROW). One unit is one lane.
 
-import { GARDEN_START, Garden, type GardenEvent } from './garden.ts';
+import { CLEAR_BONUS, GARDEN_START, Garden, type GardenEvent } from './garden.ts';
+import { City, type CityEvent } from './city.ts';
+import { Tree, type TreeEvent } from './tree.ts';
+import { Underground, type UndergroundEvent } from './underground.ts';
 import { GOAL_ROW, HALF_W, ROWS, type RowKind } from './layout.ts';
 export { GOAL_ROW, HALF_W, ROWS, type RowKind };
 
@@ -41,6 +44,7 @@ export interface Light {
 
 /** Power-ups: slow-mo (appears on the second road once the slug reaches the median) and 1UPs. */
 export const SLOWMO_TIME = 8;
+export const SLOWMO_SPAWNS = 2; // how many appear on the second road
 export const SLOW_TRAFFIC = 0.35; // traffic runs at this fraction of its speed in slow-mo
 const PICKUP_REACH = 0.45;
 const MAX_ONE_UPS = 4;
@@ -173,7 +177,15 @@ export const SHELL_FALL = 2.2; // seconds for the shell to come down
 export const ASCEND_TIME = 4.6; // …and then the snail glides up into the garden
 export const SNAIL_BONUS = 1000;
 
-export type GameState = 'ready' | 'playing' | 'munching' | 'grabbed' | 'dying' | 'ascending' | 'garden' | 'gameOver';
+/** The portal from hell: the snail becomes an earthworm, the world fades to black, and it's underground. */
+export const PORTAL_MORPH = 1.6; // when it turns into a worm
+export const PORTAL_DARK = [5, 6.2] as const; // a good look at the portal first, then fading to black, all but the worm
+export const PORTAL_TIME = 6.8; // …and underground
+export const BANANA_BONUS = 5000;
+
+export type GameState =
+  | 'ready' | 'playing' | 'munching' | 'grabbed' | 'dying' | 'ascending' | 'garden' | 'portal' | 'underground' | 'tree'
+  | 'city' | 'gameOver';
 export type DeathCause = 'squished' | 'dried' | 'salted' | 'eaten';
 
 export type GameEvent =
@@ -197,7 +209,14 @@ export type GameEvent =
   | { type: 'ascend' }
   | { type: 'shellLands' }
   | { type: 'gardenStart' }
+  | { type: 'wormMorph' }
+  | { type: 'underground' }
+  | { type: 'treeStart' }
+  | { type: 'cityStart' }
+  | CityEvent
   | GardenEvent
+  | UndergroundEvent
+  | TreeEvent
   | { type: 'munch'; slot: number }
   | { type: 'npcArrive'; id: number }
   | { type: 'npcSquish'; id: number; x: number; y: number }
@@ -252,6 +271,14 @@ export class Game {
   /** The garden, once the slug has become a snail (null before). */
   garden: Garden | null = null;
   ascendT = 0;
+  /** Act three: underground as an earthworm (null before). */
+  underground: Underground | null = null;
+  portalT = 0;
+  undergroundT = 0;
+  /** Act four: a caterpillar climbing the tree (null before). */
+  tree: Tree | null = null;
+  /** Act five: a pigeon in the city (null before). */
+  city: City | null = null;
   private ascendFrom = { x: 0, y: 0 };
   private birdTimer = 0;
   private nextId = 1;
@@ -280,12 +307,21 @@ export class Game {
   clone(): Game {
     const c = Object.assign(Object.create(Game.prototype) as Game, structuredClone({ ...this }));
     if (c.garden) Object.setPrototypeOf(c.garden, Garden.prototype);
+    if (c.underground) Object.setPrototypeOf(c.underground, Underground.prototype);
+    if (c.tree) Object.setPrototypeOf(c.tree, Tree.prototype);
+    if (c.city) Object.setPrototypeOf(c.city, City.prototype);
     return c;
   }
 
   /** Now a snail? (During the ascension and in the garden.) */
   get isSnail(): boolean {
-    return this.state === 'garden' || (this.state === 'ascending' && this.ascendT >= SHELL_FALL);
+    return this.state === 'garden' || (this.state === 'ascending' && this.ascendT >= SHELL_FALL)
+      || (this.state === 'portal' && this.portalT < PORTAL_MORPH);
+  }
+
+  /** An earthworm now? */
+  get isWorm(): boolean {
+    return this.state === 'underground' || (this.state === 'portal' && this.portalT >= PORTAL_MORPH);
   }
 
   /** Small seeded PRNG (mulberry32), so a seed replays the same traffic. */
@@ -334,6 +370,27 @@ export class Game {
         this.slowmo = 0;
         events.push({ type: 'slowmoEnd' });
       }
+    }
+    if (this.state === 'city') {
+      const cityEvents: CityEvent[] = [];
+      this.city!.update(dt, input, cityEvents);
+      for (const e of cityEvents) {
+        if (e.type === 'hitCar' || e.type === 'hitPerson' || e.type === 'squashed') this.score += e.points;
+        if (e.type === 'landTrophy') this.score += 5000;
+      }
+      events.push(...cityEvents);
+      return events;
+    }
+    if (this.state === 'tree') {
+      const treeEvents: TreeEvent[] = [];
+      this.score += this.tree!.update(dt, input, treeEvents);
+      events.push(...treeEvents);
+      if (treeEvents.some((e) => e.type === 'blownAway')) this.startCity(events);
+      return events;
+    }
+    if (this.state === 'portal' || this.state === 'underground') {
+      this.stepUnderground(dt, input, events);
+      return events;
     }
     this.stepTraffic(dt * this.trafficRate(), events);
     const inGarden = this.state === 'ascending' || this.state === 'garden';
@@ -390,6 +447,47 @@ export class Game {
   }
 
   /** All five patches eaten (and nobody still chewing): on to the next level. */
+  private stepUnderground(dt: number, input: Dir | null, events: GameEvent[]): void {
+    if (this.state === 'portal') {
+      const before = this.portalT;
+      this.portalT += dt;
+      if (before < PORTAL_MORPH && this.portalT >= PORTAL_MORPH) events.push({ type: 'wormMorph' });
+      if (this.portalT >= PORTAL_TIME) {
+        this.state = 'underground';
+        this.undergroundT = 0;
+        events.push({ type: 'underground' });
+      }
+      return;
+    }
+    this.undergroundT += dt;
+    const ugEvents: UndergroundEvent[] = [];
+    this.score += this.underground!.update(dt, input, ugEvents); // a point per bit of dirt dug
+    for (const e of ugEvents) if (e.type === 'bananaFound') this.score += BANANA_BONUS;
+    events.push(...ugEvents);
+    if (ugEvents.some((e) => e.type === 'surfaced')) this.startTree(events);
+  }
+
+  /** Space, in the city: poop. */
+  poop(): GameEvent[] {
+    const events: CityEvent[] = [];
+    if (this.state === 'city') this.city!.poop(events);
+    return events;
+  }
+
+  /** Blown on the wind, far away, into the city. */
+  private startCity(events: GameEvent[]): void {
+    this.state = 'city';
+    this.city = new City(Math.floor(this.rng() * 1e9));
+    events.push({ type: 'cityStart' });
+  }
+
+  /** Up out of the ground, at the foot of the great tree. */
+  private startTree(events: GameEvent[]): void {
+    this.state = 'tree';
+    this.tree = new Tree(Math.floor(this.rng() * 1e9));
+    events.push({ type: 'treeStart' });
+  }
+
   private allEaten(): boolean {
     return this.filled.every(Boolean) && !this.npcs.some((n) => n.state === 'munching');
   }
@@ -440,6 +538,12 @@ export class Game {
     this.garden!.update(dt, input, s, gardenEvents);
     for (const e of gardenEvents) {
       if (e.type === 'vegEaten') this.score += e.value;
+      if (e.type === 'gardenCleared') this.score += CLEAR_BONUS;
+      if (e.type === 'portal') {
+        this.state = 'portal';
+        this.portalT = 0;
+        this.underground = new Underground(Math.floor(this.rng() * 1e9));
+      }
       events.push(e);
     }
   }
@@ -658,10 +762,12 @@ export class Game {
     this.cleared = ROWS.map((_, r) => r).filter((r) => r < row);
     this.bestRow = Math.max(this.bestRow, row);
     events.push({ type: 'checkpoint', row });
-    // A slow-mo power-up appears somewhere on the next road.
+    // Two slow-mo power-ups appear in random spots on the next road.
     const road: number[] = [];
     for (let r = row + 1; r < GOAL_ROW && ROWS[r] === 'road'; r++) road.push(r);
-    if (road.length) this.spawnPowerup('slow', road[Math.floor(this.rng() * road.length)], events);
+    if (!road.length) return;
+    this.powerups = this.powerups.filter((p) => p.kind !== 'slow');
+    for (let i = 0; i < SLOWMO_SPAWNS; i++) this.spawnPowerup('slow', road[Math.floor(this.rng() * road.length)], events);
   }
 
   // ---- the bird ----------------------------------------------------------------
@@ -757,19 +863,82 @@ export class Game {
   }
 
   /** Can the skip button be used right now? (Only while crawling the road.) */
+  /**
+   * Can the skip button be used right now? On the road while crawling or munching;
+   * through the ascension; in the garden (unless the gardener has hold of you); and
+   * through the portal. Not underground: nothing comes after it.
+   */
   get canSkip(): boolean {
-    return this.state === 'playing';
+    if (this.state === 'garden') return this.garden!.phase === 'free' || this.garden!.phase === 'won';
+    if (this.state === 'underground') return this.underground!.wormState === 'free' || this.underground!.wormState === 'won';
+    if (this.state === 'tree') return true;
+    if (this.state === 'city') return this.city!.phase !== 'landed';
+    return this.state === 'playing' || this.state === 'munching' || this.state === 'ascending' || this.state === 'portal';
   }
 
-  /** The skip button: straight to the next checkpoint (or into a lettuce, past the last one). */
+  /** Is there anything left to skip to? (Landing in the trophy is the end of the line.) */
+  get hasNextCheckpoint(): boolean {
+    return this.state !== 'ready' && this.state !== 'gameOver' && !(this.state === 'city' && this.city!.phase === 'landed');
+  }
+
+  /** The skip button: straight on to the next checkpoint, whatever the mode. */
   skip(): GameEvent[] {
     const events: GameEvent[] = [];
     if (!this.canSkip) return events;
-    const next = this.nextCheckpoint();
-    Object.assign(this.slug, { x: next.x, y: next.y, facing: 'up', moving: false });
     events.push({ type: 'skip' });
-    if (next.slot !== undefined) this.startMunch(next.slot, events);
-    else if (next.y > this.checkpoint) this.reachCheckpoint(next.y, events);
+    if (this.state === 'playing') {
+      // The road: the next grass strip, or into a lettuce past the last one.
+      const next = this.nextCheckpoint();
+      Object.assign(this.slug, { x: next.x, y: next.y, facing: 'up', moving: false });
+      if (next.slot !== undefined) this.startMunch(next.slot, events);
+      else if (next.y > this.checkpoint) this.reachCheckpoint(next.y, events);
+    } else if (this.state === 'munching') {
+      this.munchT = MUNCH_TIME; // finishes on the next step
+    } else if (this.state === 'ascending') {
+      // Straight to the garden gate, a snail.
+      if (this.ascendT < SHELL_FALL) {
+        this.score += SNAIL_BONUS;
+        events.push({ type: 'shellLands' });
+      }
+      this.ascendT = ASCEND_TIME;
+      Object.assign(this.slug, { ...GARDEN_START, facing: 'up', moving: false });
+      this.state = 'garden';
+      events.push({ type: 'gardenStart' });
+    } else if (this.state === 'garden' && this.garden!.phase === 'free') {
+      // Clear the garden: on to the tantrum, the trophy and the portal.
+      const ge: GardenEvent[] = [];
+      this.garden!.clearAll(ge);
+      for (const e of ge) if (e.type === 'gardenCleared') this.score += CLEAR_BONUS;
+      events.push(...ge);
+    } else if (this.state === 'underground') {
+      // Worm: straight to the banana; or, once it's found, straight up to the tree.
+      const u = this.underground!;
+      if (u.wormState === 'free') {
+        const ue: UndergroundEvent[] = [];
+        u.skipToBanana(ue);
+        for (const e of ue) if (e.type === 'bananaFound') this.score += BANANA_BONUS;
+        events.push(...ue);
+      } else this.startTree(events);
+    } else if (this.state === 'city') {
+      const ce: CityEvent[] = [];
+      this.city!.skip(ce);
+      for (const e of ce) if (e.type === 'landTrophy') this.score += 5000;
+      events.push(...ce);
+    } else if (this.state === 'tree') {
+      // Up to the sparkles; out of the cocoon; into the gust; and, mid-gust, straight to the city.
+      if (this.tree!.gusting) this.startCity(events);
+      else {
+        const te: TreeEvent[] = [];
+        this.score += this.tree!.skipAhead(te);
+        events.push(...te);
+      }
+    } else {
+      // The garden's finale or the portal: straight down to the underground.
+      this.underground ??= new Underground(Math.floor(this.rng() * 1e9));
+      this.state = 'underground';
+      this.undergroundT = 0;
+      events.push({ type: 'underground' });
+    }
     return events;
   }
 
@@ -779,9 +948,13 @@ export class Game {
   }
 
   private spawnPowerup(kind: PowerupKind, row: number, events: GameEvent[]): void {
-    if (kind === 'slow') this.powerups = this.powerups.filter((p) => p.kind !== 'slow');
-    else if (this.powerups.filter((p) => p.kind === 'life').length >= MAX_ONE_UPS) return;
-    const x = Math.round((this.rng() - 0.5) * 12 * 2) / 2;
+    if (kind === 'life' && this.powerups.filter((p) => p.kind === 'life').length >= MAX_ONE_UPS) return;
+    // Somewhere along the row, not right on top of another power-up.
+    let x = 0;
+    for (let tries = 0; tries < 10; tries++) {
+      x = Math.round((this.rng() - 0.5) * 12 * 2) / 2;
+      if (!this.powerups.some((p) => p.y === row && Math.abs(p.x - x) < 1.5)) break;
+    }
     this.powerups.push({ id: this.nextId++, kind, x, y: row });
     events.push({ type: 'powerup', kind, x, y: row });
   }

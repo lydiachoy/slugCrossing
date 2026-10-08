@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <title>Slug Crossing</title>
+    <title>Slugger</title>
     <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/src/style.css" />
   </head>
@@ -13,11 +13,16 @@
       <div class="stat"><b>Score</b> <span id="score">0</span></div>
       <div class="stat"><b>Level</b> <span id="level">1</span></div>
       <div class="stat"><b>Slugs</b> <span id="lives"></span></div>
+      <div class="stat moist" id="energy-stat" hidden><b>Energy</b> <span class="bar"><span id="energy"></span></span></div>
+      <div class="stat" id="city-stat" hidden><b>Points</b> <span id="city-points">0/100</span></div>
+      <div class="stat" id="tree-stat" hidden><b>Leaves</b> <span id="leaves">0</span></div>
+      <div class="stat" id="height-stat" hidden><b>Height</b> <span id="height">0%</span></div>
+      <div class="stat" id="dug-stat" hidden><b>Dug</b> <span id="dug">0%</span></div>
       <div class="stat" id="veg-stat" hidden><b>Veggies</b> <span id="veg">0</span></div>
       <div class="stat moist" id="moist-stat"><b>Moisture</b> <span class="bar"><span id="moisture"></span></span></div>
       <div class="stat slow" id="slowmo"></div>
     </div>
-    <button id="skip" title="Skip to the next checkpoint" hidden>Skip ⏭</button>
+    <button id="skip" title="Skip to the next checkpoint (or the next part of the game) — or press Tab" hidden>Skip ⏭ <kbd>Tab</kbd></button>
     <div id="tint"></div>
     <div id="toast" hidden></div>
     <div id="mash" hidden>
@@ -28,7 +33,7 @@
     </div>
     <div id="panel">
       <div class="card">
-        <h1>Slug Crossing</h1>
+        <h1>Slugger</h1>
         <p id="panel-text">
           Get the slug to the lettuce. The traffic is <em>very</em> fast. The slug is not.<br />
           Watch for the <span class="warn">orange arrows</span> — a car is about to come through that lane.<br />
@@ -39,7 +44,7 @@
           Grab the <b>hourglass</b> for slow-mo. Beware the <b>salt truck</b>!<br />
           If a <b>bird</b> grabs you, mash <kbd>Space</kbd> to break free!
         </p>
-        <p class="keys">Hold <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> to crawl · <kbd>M</kbd> music · <kbd>N</kbd> sound effects</p>
+        <p class="keys">Hold <kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd> or <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> to crawl · <kbd>M</kbd> music · <kbd>N</kbd> sound effects · <kbd>Tab</kbd> skip ahead · <kbd>Space</kbd> (as a pigeon) poop</p>
         <button id="start">Start crawling</button>
       </div>
     </div>

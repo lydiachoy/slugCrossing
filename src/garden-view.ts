@@ -1,29 +1,55 @@
 import * as THREE from 'three';
+import { ParametricGeometry } from 'three/examples/jsm/geometries/ParametricGeometry.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import {
-  GARDEN_Y0, GARDEN_Y1, VISION_HALF, VISION_RANGE, type Garden, type Gardener, type Veg, type VegKind,
+  GARDEN_Y0, GARDEN_Y1, UPSET_TIME, VISION_HALF, VISION_RANGE, type Garden, type Gardener, type Veg, type VegKind,
 } from './garden.ts';
 import { HALF_W } from './layout.ts';
-import { SHELL_FALL, type Game } from './sim.ts';
+import { PORTAL_MORPH, SHELL_FALL, type Game } from './sim.ts';
 
 const std = (color: number, extra: THREE.MeshStandardMaterialParameters = {}) =>
   new THREE.MeshStandardMaterial({ color, roughness: 0.8, ...extra });
-// Not fully metallic: there's no environment for a pure metal to reflect, so it would render dark.
-const GOLD = () => new THREE.MeshStandardMaterial({ color: 0xffcf40, metalness: 0.45, roughness: 0.28, emissive: 0xb07a00, emissiveIntensity: 0.55 });
 
-/** A coiled snail shell, built from shrinking beads along a spiral. About 0.5 across. */
-export function shellMesh(material: THREE.Material = GOLD()): THREE.Mesh {
-  const parts: THREE.BufferGeometry[] = [];
-  const turns = 2.6, beads = 34;
-  for (let i = 0; i < beads; i++) {
-    const k = i / (beads - 1);
-    const theta = k * turns * Math.PI * 2;
-    const r = 0.21 * Math.exp(-0.2 * theta); // logarithmic spiral, tightening to the tip
-    const bead = new THREE.SphereGeometry(Math.max(0.025, r * 0.78), 12, 8);
-    bead.translate(r * Math.cos(theta), r * Math.sin(theta), k * 0.12); // a little conical
-    parts.push(bead);
+/**
+ * A coiled snail shell: a tube that widens as it winds out along a logarithmic
+ * spiral, each whorl nestling against the last, with a slight spire. Coils in the
+ * XY plane (axis along z), about 0.5 across, with amber bands following the whorls.
+ */
+export function shellMesh(material?: THREE.Material): THREE.Mesh {
+  const turns = 2.3; // (the tiny innermost whorls are left off: they'd just be a wisp)
+  const b = 0.16; // growth per radian: each whorl is e^(2πb) ≈ 2.7× the last
+  const a = 0.16 * Math.exp(-b * turns * Math.PI * 2); // so the outer whorl's centre is 0.16 out
+  // Fat whorls that overlap the one inside, like a real shell (just touching would be 1).
+  const fit = (1 - Math.exp(-2 * Math.PI * b)) / (1 + Math.exp(-2 * Math.PI * b)) * 1.55;
+  const geo = new ParametricGeometry((u, v, target) => {
+    const theta = u * turns * Math.PI * 2; // along the coil, tip (u = 0) to mouth (u = 1)
+    const phi = v * Math.PI * 2; // around the tube
+    const R = a * Math.exp(b * theta);
+    const r = R * fit;
+    const spire = 0.07 * (1 - u) ** 2; // the centre bulges a little out of the plane
+    target.set(
+      (R + r * Math.cos(phi)) * Math.cos(theta),
+      (R + r * Math.cos(phi)) * Math.sin(theta),
+      spire + r * Math.sin(phi) * 1.15,
+    );
+  }, 160, 18);
+  geo.computeVertexNormals();
+  // Bands along the whorls: gold with darker amber stripes.
+  const pos = geo.getAttribute('position');
+  const colors = new Float32Array(pos.count * 3);
+  const gold = new THREE.Color(0xffd24a), amber = new THREE.Color(0xc07812), c = new THREE.Color();
+  const segs = 18 + 1;
+  for (let i = 0; i < pos.count; i++) {
+    const v = (i % segs) / (segs - 1);
+    const band = Math.max(0, Math.sin(v * Math.PI * 2 * 3)) ** 3; // three stripes round the tube
+    c.copy(gold).lerp(amber, band * 0.85);
+    colors.set([c.r, c.g, c.b], i * 3);
   }
-  const m = new THREE.Mesh(mergeGeometries(parts), material);
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  const m = new THREE.Mesh(geo, material ?? new THREE.MeshStandardMaterial({
+    // Not fully metallic: there's no environment for a pure metal to reflect, so it would render dark.
+    vertexColors: true, metalness: 0.45, roughness: 0.28, emissive: 0x8a5a00, emissiveIntensity: 0.45,
+  }));
   m.castShadow = true;
   return m;
 }
@@ -39,6 +65,22 @@ export class GardenView {
   private cone: THREE.Mesh;
   private coneMat = new THREE.MeshBasicMaterial({ color: 0xfff27a, transparent: true, opacity: 0.22, depthWrite: false, side: THREE.DoubleSide });
   private alarm: THREE.Sprite;
+  // The tantrum: his hat (it gets flung down), his face (it goes red), and a cloud of swearing.
+  private hat = new THREE.Group();
+  private skinMat = std(0xf0c8a0);
+  private grawlix: THREE.Sprite;
+  // The trophy, and confetti.
+  private trophy: THREE.Group;
+  private confetti: { mesh: THREE.Mesh; vel: THREE.Vector3; spin: THREE.Vector3; age: number }[] = [];
+  private confettiGeo = new THREE.PlaneGeometry(0.09, 0.05);
+  private trophyShown = false;
+  // The portal from hell.
+  private portal: THREE.Group;
+  private portalSwirl: THREE.Mesh;
+  private portalLight = new THREE.PointLight(0xff3a10, 0, 8, 1.5);
+  private flames: { mesh: THREE.Mesh; vel: THREE.Vector3; age: number; life: number }[] = [];
+  private flameGeo = new THREE.TetrahedronGeometry(0.09);
+  private smokeShown = false;
   private lastPos = new THREE.Vector2();
   private stride = 0;
   // Ascension.
@@ -69,6 +111,28 @@ export class GardenView {
     this.alarm.scale.setScalar(0.7);
     this.alarm.visible = false;
     this.scene.add(this.alarm);
+    this.grawlix = new THREE.Sprite(new THREE.SpriteMaterial({ map: grawlixTexture(), depthTest: false }));
+    this.grawlix.scale.set(1.5, 0.75, 1);
+    this.grawlix.visible = false;
+    this.scene.add(this.grawlix);
+    this.trophy = trophyMesh();
+    this.trophy.visible = false;
+    this.scene.add(this.trophy);
+    // A swirling disc of hellfire with a scorched, cracked rim.
+    this.portal = new THREE.Group();
+    this.portalSwirl = new THREE.Mesh(
+      new THREE.CircleGeometry(1, 48).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ map: hellTexture(), transparent: true }),
+    );
+    this.portalSwirl.position.y = 0.09;
+    const rim = new THREE.Mesh(new THREE.RingGeometry(0.95, 1.25, 48).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: 0x1a0805 }));
+    rim.position.y = 0.085;
+    const fireGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glow, color: 0xff4a10, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0.8 }));
+    fireGlow.scale.setScalar(3.5);
+    fireGlow.position.y = 0.3;
+    this.portal.add(rim, this.portalSwirl, fireGlow);
+    this.portal.visible = false;
+    this.scene.add(this.portal, this.portalLight);
 
     // Ascension: a beam from the heavens, the shell coming down it, a flash on landing.
     this.beam = new THREE.Mesh(
@@ -100,6 +164,90 @@ export class GardenView {
     if (!g) return;
     for (const v of g.veg) this.updateVeg(v, dt);
     this.updateGardener(g.gardener, dt, time);
+    this.updateTrophy(game, dt, time);
+    this.updatePortal(game, dt, time);
+  }
+
+  /** A portal from hell opening up beneath the snail. */
+  private updatePortal(game: Game, dt: number, time: number): void {
+    const open = game.state === 'portal';
+    this.portal.visible = open;
+    this.portalLight.intensity = 0;
+    if (open) {
+      const t = game.portalT, s = game.slug;
+      const k = Math.min(1, t / 1.1);
+      const size = 0.15 + 1.1 * (1 - Math.pow(1 - k, 3)) + Math.sin(time * 9) * 0.03;
+      this.portal.position.set(s.x, 0, -s.y + 0.1);
+      this.portal.scale.setScalar(size);
+      this.portalSwirl.rotation.y = -time * 3;
+      this.portalLight.position.set(s.x, 0.6, -s.y);
+      this.portalLight.intensity = 25 * k * (0.8 + Math.sin(time * 17) * 0.2);
+      // Flames licking up round the edge.
+      for (let i = 0; i < 3; i++) {
+        if (Math.random() > dt * 60 * k) continue;
+        const a = Math.random() * Math.PI * 2, r = size * (0.5 + Math.random() * 0.6);
+        const mesh = new THREE.Mesh(this.flameGeo, new THREE.MeshBasicMaterial({ color: [0xff3a10, 0xff8a1a, 0xffd23a][Math.floor(Math.random() * 3)], transparent: true }));
+        mesh.position.set(s.x + Math.cos(a) * r, 0.1, -s.y + 0.1 + Math.sin(a) * r);
+        this.scene.add(mesh);
+        this.flames.push({ mesh, vel: new THREE.Vector3((Math.random() - 0.5) * 0.4, 1.5 + Math.random() * 2, (Math.random() - 0.5) * 0.4), age: 0, life: 0.5 + Math.random() * 0.5 });
+      }
+      // The moment it turns into a worm: a big puff of brimstone smoke.
+      if (t >= PORTAL_MORPH && !this.smokeShown) {
+        this.smokeShown = true;
+        for (let i = 0; i < 40; i++) this.sparkle(new THREE.Vector3(s.x, 0.5, -s.y), 2.5);
+      }
+    } else this.smokeShown = false;
+    for (const f of this.flames) {
+      f.age += dt;
+      f.mesh.position.addScaledVector(f.vel, dt);
+      f.mesh.rotation.x += dt * 9;
+      f.mesh.scale.setScalar(Math.max(0, 1 - f.age / f.life));
+      (f.mesh.material as THREE.MeshBasicMaterial).opacity = 1 - f.age / f.life;
+    }
+    this.flames = this.flames.filter((f) => (f.age < f.life ? true : (f.mesh.removeFromParent(), (f.mesh.material as THREE.Material).dispose(), false)));
+  }
+
+  /** Garden cleared: after the tantrum, the snail holds up its trophy amid confetti. */
+  private updateTrophy(game: Game, dt: number, time: number): void {
+    const g = game.garden!;
+    const show = g.phase === 'won' && g.phaseT >= UPSET_TIME;
+    this.trophy.visible = show;
+    if (show) {
+      const k = Math.min(1, (g.phaseT - UPSET_TIME) / 0.5);
+      const s = game.slug;
+      // Held aloft on the tips of its eye stalks (it faces the camera, at +z), bobbing with pride.
+      this.trophy.position.set(s.x, 0.5 + 0.72 * k + Math.sin(time * 5) * 0.05, -s.y + 0.12);
+      this.trophy.rotation.set(0, Math.sin(time * 2) * 0.5, Math.sin(time * 4) * 0.08);
+      this.trophy.scale.setScalar(0.4 + 0.6 * k);
+      if (!this.trophyShown) {
+        this.trophyShown = true;
+        for (let i = 0; i < 160; i++) this.popConfetti(s.x, -s.y + 0.4);
+      }
+      if (Math.random() < dt * 14) this.sparkle(this.trophy.position.clone().add(new THREE.Vector3(0, 0.35, 0)), 1);
+      if (Math.random() < dt * 25) this.popConfetti(s.x + (Math.random() - 0.5) * 6, -s.y + (Math.random() - 0.5) * 3, true);
+    } else this.trophyShown = false;
+    for (const c of this.confetti) {
+      c.age += dt;
+      c.vel.y = Math.max(-1.2, c.vel.y - 6 * dt); // flutters down slowly
+      c.vel.x *= 1 - dt * 1.5;
+      c.vel.z *= 1 - dt * 1.5;
+      c.mesh.position.addScaledVector(c.vel, dt);
+      c.mesh.rotation.x += c.spin.x * dt;
+      c.mesh.rotation.y += c.spin.y * dt;
+      if (c.mesh.position.y < 0.05) c.vel.set(0, 0, 0);
+    }
+    this.confetti = this.confetti.filter((c) => (c.age < 6 ? true : (c.mesh.removeFromParent(), false)));
+  }
+
+  private popConfetti(x: number, z: number, fromSky = false): void {
+    const colors = [0xff4f6d, 0xffd23f, 0x4fc3ff, 0x6ddf6d, 0xc77dff, 0xff9f43];
+    const mesh = new THREE.Mesh(this.confettiGeo, new THREE.MeshBasicMaterial({ color: colors[Math.floor(Math.random() * colors.length)], side: THREE.DoubleSide }));
+    mesh.position.set(x, fromSky ? 4 + Math.random() * 2 : 0.8, z);
+    this.scene.add(mesh);
+    const vel = fromSky ? new THREE.Vector3(0, -0.5, 0)
+      : new THREE.Vector3((Math.random() - 0.5) * 6, 3 + Math.random() * 4, (Math.random() - 0.5) * 6);
+    const spin = new THREE.Vector3(Math.random() * 12, Math.random() * 12, 0);
+    this.confetti.push({ mesh, vel, spin, age: 0 });
   }
 
   // ---- the ascension ----------------------------------------------------------------
@@ -250,7 +398,7 @@ export class GardenView {
   /** Straw hat, beard, plaid shirt, blue overalls, big boots. Faces -z. */
   private buildGardener(): void {
     const g = this.gardener;
-    const denim = std(0x3c5f9c), shirt = std(0xc4473a), skin = std(0xf0c8a0), boot = std(0x3a2a1c), straw = std(0xe3c47a, { roughness: 0.9 });
+    const denim = std(0x3c5f9c), shirt = std(0xc4473a), skin = this.skinMat, boot = std(0x3a2a1c), straw = std(0xe3c47a, { roughness: 0.9 });
     for (const side of [-1, 1]) {
       const hip = new THREE.Group();
       hip.position.set(side * 0.13, 0.75, 0);
@@ -297,7 +445,8 @@ export class GardenView {
     crown.position.y = 1.77;
     const band = new THREE.Mesh(new THREE.CylinderGeometry(0.235, 0.235, 0.05, 16), std(0x7a2a1c));
     band.position.y = 1.7;
-    g.add(head, beard, nose, brim, crown, band);
+    this.hat.add(brim, crown, band);
+    g.add(head, beard, nose, this.hat);
     g.traverse((o) => (o.castShadow = true));
     g.scale.setScalar(1.15);
     this.scene.add(g);
@@ -314,8 +463,27 @@ export class GardenView {
     const swing = moved > 0.001 ? Math.sin(this.stride) * Math.min(0.8, 0.35 + moved / dt * 0.12) : 0;
     this.legs.forEach((l, i) => (l.rotation.x = (i ? 1 : -1) * swing));
     g.position.y = Math.abs(Math.sin(this.stride)) * 0.04 * (moved > 0.001 ? 1 : 0);
+    // Face: red with rage during the tantrum.
+    const rage = gd.state === 'upset' ? Math.min(1, gd.t / 0.8) : 0;
+    this.skinMat.color.setHex(0xf0c8a0).lerp(new THREE.Color(0xe0302a), rage * 0.85);
+    this.hat.position.set(0, 0, 0);
+    this.hat.rotation.set(0, 0, 0);
+    this.grawlix.visible = false;
     // Arms: swinging, or holding the snail up, or the big throw.
-    if (gd.state === 'carry') {
+    if (gd.state === 'upset') {
+      // TANTRUM: stomping up and down, shaking his fists, hat flung to the ground.
+      const t = gd.t;
+      g.position.y = Math.abs(Math.sin(t * 9)) * 0.2;
+      this.legs.forEach((l, i) => (l.rotation.x = (i ? 1 : -1) * Math.sin(t * 9) * 0.7));
+      this.arms.forEach((a, i) => a.rotation.set(-2.9 + Math.sin(t * 30 + i * 2) * 0.3, 0, (i ? -1 : 1) * 0.25));
+      g.rotation.z = Math.sin(t * 9) * 0.06;
+      // The hat: flung up off his head, then lands on the ground in front of him.
+      const k = Math.min(1, t / 0.7);
+      this.hat.position.set(0, 1.0 * Math.sin(k * Math.PI) - 1.6 * k, -0.55 * k);
+      this.hat.rotation.set(k * Math.PI * 3, 0, k * 0.4);
+      this.grawlix.visible = true;
+      this.grawlix.position.set(gd.x + Math.sin(t * 20) * 0.05, 2.9 + Math.abs(Math.sin(t * 6)) * 0.15, -gd.y);
+    } else if (gd.state === 'carry') {
       this.arms[1].rotation.set(-2.6, 0, 0); // snail held high in his right hand
       this.arms[0].rotation.set(-0.3, 0, 0.3);
     } else if (gd.state === 'throw') {
@@ -333,7 +501,7 @@ export class GardenView {
     this.cone.rotation.y = gd.gaze;
     this.coneMat.color.setHex(angry ? 0xff4a3a : 0xfff27a);
     this.coneMat.opacity = angry ? 0.3 : 0.2 + Math.sin(time * 3) * 0.03;
-    this.cone.visible = gd.state !== 'carry' && gd.state !== 'throw';
+    this.cone.visible = gd.state !== 'carry' && gd.state !== 'throw' && gd.state !== 'upset';
     if (angry) {
       this.alarm.visible = true;
       this.alarm.position.set(gd.x, 2.6 + Math.abs(Math.sin(time * 10)) * 0.1, -gd.y);
@@ -422,4 +590,94 @@ function vegMesh(kind: VegKind): THREE.Group {
     for (const a of [0.5, 2.5, 4.4]) add(new THREE.SphereGeometry(0.17, 8, 6), leaf, Math.cos(a) * 0.2, 0.04, Math.sin(a) * 0.2).scale.set(1, 0.25, 0.6);
   }
   return g;
+}
+
+/** A swearing cloud: "#@$%!" in a jagged red burst. */
+function grawlixTexture(): THREE.Texture {
+  const c = document.createElement('canvas');
+  c.width = 256;
+  c.height = 128;
+  const ctx = c.getContext('2d')!;
+  ctx.beginPath();
+  for (let i = 0; i < 24; i++) {
+    const a = (i / 24) * Math.PI * 2, r = i % 2 ? 0.78 : 1;
+    ctx.lineTo(128 + Math.cos(a) * 120 * r, 64 + Math.sin(a) * 58 * r);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = '#e0302a';
+  ctx.stroke();
+  ctx.fillStyle = '#c4201a';
+  ctx.font = 'bold 54px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('#@$%!', 128, 68);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+/** A golden trophy cup with two handles, on a little plinth. About 0.6 tall. */
+export function trophyMesh(): THREE.Group {
+  const g = new THREE.Group();
+  const gold = new THREE.MeshStandardMaterial({ color: 0xffd04a, metalness: 0.5, roughness: 0.25, emissive: 0x9a6a00, emissiveIntensity: 0.5 });
+  const profile = [
+    [0.0, 0.0], [0.16, 0.0], [0.16, 0.04], [0.06, 0.08], [0.04, 0.18], [0.03, 0.26],
+    [0.06, 0.3], [0.17, 0.38], [0.2, 0.5], [0.21, 0.62], [0.19, 0.62], [0.17, 0.5], [0.0, 0.42],
+  ].map(([x, y]) => new THREE.Vector2(x, y));
+  const cup = new THREE.Mesh(new THREE.LatheGeometry(profile, 28), gold);
+  cup.castShadow = true;
+  g.add(cup);
+  for (const side of [-1, 1]) {
+    const handle = new THREE.Mesh(new THREE.TorusGeometry(0.08, 0.018, 8, 16, Math.PI), gold);
+    handle.rotation.z = side * -Math.PI / 2;
+    handle.position.set(side * 0.2, 0.5, 0);
+    g.add(handle);
+  }
+  const plinth = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.08, 0.3), new THREE.MeshStandardMaterial({ color: 0x3a2a1c, roughness: 0.6 }));
+  plinth.position.y = -0.04;
+  g.add(plinth);
+  // A star on the front.
+  const star = new THREE.Shape();
+  for (let i = 0; i < 10; i++) {
+    const a = (i / 10) * Math.PI * 2 - Math.PI / 2, r = i % 2 ? 0.03 : 0.07;
+    if (i === 0) star.moveTo(Math.cos(a) * r, -Math.sin(a) * r);
+    else star.lineTo(Math.cos(a) * r, -Math.sin(a) * r);
+  }
+  const badge = new THREE.Mesh(new THREE.ShapeGeometry(star), new THREE.MeshBasicMaterial({ color: 0xfff6c0 }));
+  badge.position.set(0, 0.5, 0.21);
+  g.add(badge);
+  return g;
+}
+
+/** A swirl of hellfire: red, orange and yellow spiral arms around a black heart. */
+function hellTexture(): THREE.Texture {
+  const c = document.createElement('canvas');
+  c.width = c.height = 256;
+  const ctx = c.getContext('2d')!;
+  const grad = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+  grad.addColorStop(0, '#000000');
+  grad.addColorStop(0.25, '#3a0500');
+  grad.addColorStop(0.6, '#b01a00');
+  grad.addColorStop(0.9, '#ff6a00');
+  grad.addColorStop(1, '#ffb020');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(128, 128, 128, 0, Math.PI * 2);
+  ctx.fill();
+  for (let arm = 0; arm < 5; arm++) {
+    ctx.strokeStyle = arm % 2 ? 'rgba(255,200,60,0.7)' : 'rgba(255,90,0,0.8)';
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    for (let t = 0; t < 1; t += 0.01) {
+      const a = arm * (Math.PI * 2 / 5) + t * Math.PI * 3, r = t * 120;
+      ctx.lineTo(128 + Math.cos(a) * r, 128 + Math.sin(a) * r);
+    }
+    ctx.stroke();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
 }

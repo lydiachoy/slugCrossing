@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  CHASE_SPEED, EAT_TIME, GARDEN_START, GARDEN_Y0, GARDEN_Y1, Garden, REGROW_TIME, VEG_VALUE, VISION_RANGE,
+  CHASE_SPEED, EAT_TIME, GARDEN_START, GARDEN_Y0, GARDEN_Y1, Garden, PORTAL_AT, UPSET_TIME, VEG_VALUE, VISION_RANGE,
   type GardenEvent,
 } from '../src/garden.ts';
 import { HALF_W } from '../src/layout.ts';
@@ -32,7 +32,7 @@ test('the garden is full of rocks and vegetables, laid out the same for the same
   assert.ok(!a.blocked(GARDEN_START.x, GARDEN_START.y, 0.5), 'the way in is clear');
 });
 
-test('the snail eats a vegetable by staying on it; it grows back later', () => {
+test('the snail eats a vegetable by staying on it, and it never grows back', () => {
   const g = quiet();
   const v = g.veg[0];
   const s = snail(v.x, v.y - v.r - 0.2);
@@ -42,9 +42,8 @@ test('the snail eats a vegetable by staying on it; it grows back later', () => {
   assert.ok(events.filter((e) => e.type === 'vegBite').length >= 3, 'chomp chomp chomp');
   assert.equal(v.eaten, 1);
   s.x = 99; // wander off
-  const later = run(g, s, REGROW_TIME + 0.1);
-  assert.ok(later.some((e) => e.type === 'vegRegrow' && e.id === v.id));
-  assert.equal(v.eaten, 0);
+  run(g, s, 60);
+  assert.equal(v.eaten, 1, 'still gone a minute later');
 });
 
 test('rocks are solid', () => {
@@ -103,4 +102,24 @@ test('after being thrown the snail comes back behind the rock nearest where it w
   const nearest = g.rocks.reduce((a, b) => (Math.hypot(b.x - s.x, b.y - s.y) < Math.hypot(a.x - s.x, a.y - s.y) ? b : a));
   assert.equal(nearest, near, 'by the same rock');
   assert.ok(Math.hypot(s.x - near.x, s.y - near.y) < near.r + 0.6, 'tucked right up against it');
+});
+
+test('eating the last vegetable clears the garden: a tantrum, then a trophy, then the portal', () => {
+  const g = quiet();
+  for (const v of g.veg.slice(1)) v.eaten = 1;
+  const last = g.veg[0];
+  const s = snail(last.x, last.y - last.r - 0.2);
+  const events = run(g, s, EAT_TIME + 0.2);
+  assert.ok(events.some((e) => e.type === 'gardenCleared'));
+  assert.equal(g.phase, 'won');
+  assert.equal(g.gardener.state, 'upset');
+  // The snail stays put for its moment of glory, and nobody can catch it now.
+  const x = s.x, y = s.y;
+  const after = run(g, s, PORTAL_AT, 'left');
+  assert.equal(s.x, x);
+  assert.equal(s.y, y);
+  assert.ok(!after.some((e) => e.type === 'spotted' || e.type === 'caught'));
+  const trophy = after.findIndex((e) => e.type === 'trophy'), portal = after.findIndex((e) => e.type === 'portal');
+  assert.ok(trophy >= 0 && portal > trophy, 'trophy first, then the portal from hell');
+  assert.ok(UPSET_TIME < PORTAL_AT);
 });

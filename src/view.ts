@@ -2,12 +2,17 @@ import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import {
-  ASCEND_TIME, CROSSWALK_HALF, DEATH_TIME, GOAL_ROW, SHELL_FALL, Game as GameClass, HALF_W, LIGHT_ROWS, MUNCH_TIME, ROWS, SLOTS,
+  ASCEND_TIME, CROSSWALK_HALF, DEATH_TIME, GOAL_ROW, PORTAL_DARK, PORTAL_MORPH, SHELL_FALL, Game as GameClass, HALF_W, LIGHT_ROWS, MUNCH_TIME, ROWS, SLOTS,
   SPAWN_MARGIN, type Game, type GameEvent, type Powerup, type Vehicle, type VehicleKind,
 } from './sim.ts';
 import { BirdModel } from './bird-model.ts';
-import { GARDEN_Y0 } from './garden.ts';
+import { GARDEN_Y0, UPSET_TIME } from './garden.ts';
 import { GardenView } from './garden-view.ts';
+import { CityView } from './city-view.ts';
+import { GUST_TIME } from './tree.ts';
+import { TreeView } from './tree-view.ts';
+import { UndergroundView } from './underground-view.ts';
+import { WormModel } from './worm-model.ts';
 import { Ghost, SLUG_PALETTE, SlugModel, type SlugPose } from './slug-model.ts';
 
 // Sim (x, y) → world (x, 0, -y): the slug crawls away from the camera.
@@ -31,6 +36,15 @@ export class View {
   private gardenView!: GardenView;
   /** 0 = looking at the road; 1 = looking at the garden beyond the hedge. */
   private gardenPan = 0;
+  private undergroundView = new UndergroundView();
+  private treeView = new TreeView();
+  readonly cityView = new CityView();
+  /** The fade to black, and the worm drawn on top of it (so it alone stays visible). */
+  private fadeScene = new THREE.Scene();
+  private fadeCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private fadeMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, depthTest: false });
+  private wormScene = new THREE.Scene();
+  private portalWorm = new WormModel();
   private rivals = new Map<number, SlugModel>();
   private ghosts: Ghost[] = [];
   private splats: { mesh: THREE.Mesh; age: number }[] = [];
@@ -88,6 +102,12 @@ export class View {
     this.buildCrossing();
     this.scene.add(this.player.root);
     this.bird = new BirdModel(this.scene);
+    this.renderer.autoClear = false;
+    this.fadeScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.fadeMat));
+    this.wormScene.add(new THREE.AmbientLight(0xffffff, 1.2), this.portalWorm.root);
+    const key = new THREE.DirectionalLight(0xffe0c0, 2);
+    key.position.set(-3, 6, 4);
+    this.wormScene.add(key);
     this.gardenView = new GardenView(this.scene, glowTexture());
   }
 
@@ -140,11 +160,32 @@ export class View {
 
   render(game: Game, dt: number): void {
     this.time += dt;
+    this.renderer.clear();
+    if (game.state === 'city') {
+      // Act five: the city — out of the white-out of the gust.
+      this.cityView.render(this.renderer, game.city!, dt, this.time);
+      this.fade(1 - Math.min(1, game.city!.t / 1.2), 0xffffff);
+      return;
+    }
+    if (game.state === 'tree') {
+      // Act four: up the great tree — fading in from the dark of the tunnel, and out into the gust's white-out.
+      const t = game.tree!;
+      this.treeView.render(this.renderer, t, dt, this.time);
+      this.fade(1 - Math.min(1, t.t / 0.6));
+      if (t.gusting) this.fade(THREE.MathUtils.clamp((t.wonT - t.gustAt - 0.6) / (GUST_TIME - 0.6), 0, 1), 0xffffff);
+      return;
+    }
+    if (game.state === 'underground') {
+      // Act three: side-on, underground — fading in from the black.
+      this.undergroundView.render(this.renderer, game.underground!, dt, this.time);
+      this.fade(1 - Math.min(1, game.undergroundT / 1.2));
+      return;
+    }
     this.syncVehicles(game, dt);
     this.bird.update(game.bird, game.slug, this.time);
     this.gardenView.update(game, dt, this.time);
     // The camera follows the snail up into the garden as it glides over the hedge.
-    this.gardenPan = game.state === 'garden' ? 1 : game.state === 'ascending' ? this.ascendGlide(game) : 0;
+    this.gardenPan = game.state === 'garden' || game.state === 'portal' ? 1 : game.state === 'ascending' ? this.ascendGlide(game) : 0;
     this.syncSlugs(game, dt);
     this.syncPowerups(game);
     this.syncSalt(game);
@@ -205,11 +246,22 @@ export class View {
       h.visible = isRed === game.light.red;
     }
 
-    // The player's victory munch gets a close-up.
+    // Close-ups: the player's victory munch; and, when the garden's cleared, first the
+    // gardener's tantrum, then the snail with its trophy.
     const munching = game.state === 'munching';
-    if (munching) this.focusAt.set(game.slug.x, 0.4, -game.slug.y + 0.2);
-    const swoopIn = munching && game.munchT < MUNCH_TIME - 0.45;
-    this.focus = THREE.MathUtils.clamp(this.focus + (swoopIn ? dt / 0.45 : -dt / 0.5), 0, 1);
+    const won = game.garden?.phase === 'won' ? game.garden : null;
+    let swoopIn = false;
+    if (munching) {
+      this.focusAt.set(game.slug.x, 0.4, -game.slug.y + 0.2);
+      swoopIn = game.munchT < MUNCH_TIME - 0.45;
+    } else if (won) {
+      const gd = won.gardener;
+      const at = won.phaseT < UPSET_TIME ? new THREE.Vector3(gd.x, 1.1, -gd.y) : new THREE.Vector3(game.slug.x, 0.75, -game.slug.y + 0.4);
+      // Glide from one to the other rather than cutting.
+      this.focusAt.lerp(at, this.focus > 0.05 ? 1 - Math.exp(-dt * 3) : 1);
+      swoopIn = true;
+    }
+    this.focus = THREE.MathUtils.clamp(this.focus + (swoopIn ? dt / 0.6 : -dt / 0.5), 0, 1);
 
     this.shake = Math.max(0, this.shake - dt);
     const s = this.shake * 0.5;
@@ -217,6 +269,15 @@ export class View {
     this.camera.position.x += (Math.random() - 0.5) * s;
     this.camera.position.y += (Math.random() - 0.5) * s;
     this.renderer.render(this.scene, this.camera);
+    if (game.state === 'portal') {
+      // Everything but the worm fades to black.
+      const [a, b] = PORTAL_DARK;
+      this.fade(THREE.MathUtils.clamp((game.portalT - a) / (b - a), 0, 1));
+      if (game.isWorm) {
+        this.renderer.clearDepth();
+        this.renderer.render(this.wormScene, this.camera);
+      }
+    }
   }
 
   // ---- static scenery --------------------------------------------------------
@@ -426,7 +487,7 @@ export class View {
   private syncSlugs(game: Game, dt: number): void {
     const s = game.slug;
     this.player.setShell(game.isSnail);
-    if (game.state === 'ascending' || game.state === 'garden') {
+    if (game.state === 'ascending' || game.state === 'garden' || game.state === 'portal') {
       this.syncSnail(game, dt);
       this.syncRivals(game, dt);
       return;
@@ -454,8 +515,35 @@ export class View {
   }
 
   /** The snail: gliding up during the ascension; in the garden, roaming, chewing, held or thrown. */
+  /** Draw a colour (black, unless told otherwise) over the whole frame at this opacity. */
+  private fade(opacity: number, color = 0x000000): void {
+    if (opacity <= 0) return;
+    this.fadeMat.opacity = opacity;
+    this.fadeMat.color.setHex(color);
+    this.renderer.clearDepth();
+    this.renderer.render(this.fadeScene, this.fadeCam);
+  }
+
   private syncSnail(game: Game, dt: number): void {
     const s = game.slug;
+    if (game.state === 'portal') {
+      if (game.portalT < PORTAL_MORPH) {
+        // Trembling over the abyss…
+        const shake = Math.min(1, game.portalT / 0.8) * 0.06;
+        this.player.update({ ...s, x: s.x + (Math.random() - 0.5) * shake, mode: 'carried', t: 0, z: 0.15 }, dt, this.time);
+      } else {
+        // …and now an earthworm, writhing where the snail was.
+        this.player.update({ ...s, mode: 'hidden', t: 0 }, dt, this.time);
+        const sink = Math.max(0, game.portalT - PORTAL_DARK[1]) * 0.6;
+        const pts = Array.from({ length: 16 }, (_, i) => new THREE.Vector3(
+          s.x + Math.sin(i * 0.55 + this.time * 7) * 0.22,
+          0.22 + Math.sin(this.time * 9 + i * 0.4) * 0.04 - sink,
+          -s.y + 0.4 - i * 0.15,
+        ));
+        this.portalWorm.pose(pts, this.time, true);
+      }
+      return;
+    }
     if (game.state === 'ascending') {
       const k = this.ascendGlide(game);
       const mode = game.ascendT < SHELL_FALL ? 'munch' : 'crawl';
@@ -469,7 +557,8 @@ export class View {
       this.player.update({ ...s, mode: 'flung', t: g.phaseT, z: g.z + 0.5 }, dt, this.time);
     } else {
       const chewing = g.veg.some((v) => v.eaten > 0 && v.eaten < 1 && Math.hypot(v.x - s.x, v.y - s.y) < v.r + 0.4);
-      this.player.update({ ...s, mode: 'crawl', t: 0, chewing }, dt, this.time);
+      const cheering = g.phase === 'won' && g.phaseT >= UPSET_TIME;
+      this.player.update({ ...s, mode: cheering ? 'cheer' : 'crawl', t: g.phaseT - UPSET_TIME, chewing }, dt, this.time);
     }
   }
 

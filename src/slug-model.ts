@@ -9,6 +9,8 @@ export const SLUG_PALETTE = [
   { body: 0xe0702a, foot: 0xb85a20, spots: 0x6a2c0c, dry: 0x9a6a4a }, // red-orange roundback
   { body: 0x333036, foot: 0x222024, spots: 0x0c0c0c, dry: 0x5a5650 }, // black slug
 ];
+/** Once it's a snail: soft grey-tan skin under the golden shell. */
+const SNAIL_COLORS = { body: 0xb9a68a, foot: 0x9c8a70, spots: 0x6a5a48, dry: 0x8a7a64 };
 export const SLUG_SCALE = 1.35; // drawn a little larger than its hit box, to read at a distance
 
 const YAW: Record<Dir, number> = { up: 0, left: Math.PI / 2, down: Math.PI, right: -Math.PI / 2 };
@@ -20,7 +22,7 @@ export interface SlugPose {
   y: number;
   facing: Dir;
   moving: boolean;
-  mode: 'hidden' | 'crawl' | 'squished' | 'dried' | 'salted' | 'munch' | 'flung' | 'carried';
+  mode: 'hidden' | 'crawl' | 'squished' | 'dried' | 'salted' | 'munch' | 'flung' | 'carried' | 'cheer';
   /** Seconds into the current mode (dying / munching). */
   t: number;
   moisture: number;
@@ -39,11 +41,16 @@ export class SlugModel {
   private mouth: THREE.Mesh;
   private yaw = 0;
   private colors: (typeof SLUG_PALETTE)[number];
+  private slugColors: (typeof SLUG_PALETTE)[number];
+  private footMat: THREE.MeshStandardMaterial;
+  /** Slug-only parts (mantle hump, spots), hidden on a snail. */
+  private slugBits: THREE.Object3D[] = [];
+  private tube: THREE.Mesh;
   /** The golden shell, once it's a snail. */
   private shell: THREE.Group | null = null;
 
   constructor(palette: number, scale = SLUG_SCALE) {
-    this.colors = SLUG_PALETTE[palette];
+    this.colors = this.slugColors = SLUG_PALETTE[palette];
     this.mat = new THREE.MeshPhysicalMaterial({ color: this.colors.body, roughness: 0.25, clearcoat: 1, clearcoatRoughness: 0.15 });
     const body = this.body;
     const tube = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.5, 6, 16).rotateX(Math.PI / 2), this.mat);
@@ -52,16 +59,20 @@ export class SlugModel {
     const mantle = new THREE.Mesh(new THREE.SphereGeometry(0.2, 16, 12), this.mat);
     mantle.scale.set(0.95, 0.75, 1.3);
     mantle.position.set(0, 0.17, -0.12);
-    const foot = new THREE.Mesh(new THREE.CapsuleGeometry(0.19, 0.5, 4, 16).rotateX(Math.PI / 2), std(this.colors.foot, { roughness: 0.4 }));
+    this.footMat = std(this.colors.foot, { roughness: 0.4 });
+    const foot = new THREE.Mesh(new THREE.CapsuleGeometry(0.19, 0.5, 4, 16).rotateX(Math.PI / 2), this.footMat);
     foot.scale.set(1, 0.25, 1.02);
     foot.position.y = 0.04;
     body.add(tube, mantle, foot);
+    this.tube = tube;
+    this.slugBits.push(mantle);
     const spots = std(this.colors.spots, { roughness: 0.4 });
     for (const [x, z, r] of [[0.08, 0.05, 0.022], [-0.1, 0.15, 0.03], [0.05, 0.3, 0.025], [-0.04, -0.1, 0.02], [0.1, -0.2, 0.018]]) {
       const s = new THREE.Mesh(new THREE.SphereGeometry(r, 6, 4), spots);
       s.position.set(x, 0.2, z);
       s.scale.y = 0.4;
       body.add(s);
+      this.slugBits.push(s);
     }
     const eye = std(0x111111, { roughness: 0.2 });
     for (const side of [-1, 1]) {
@@ -93,18 +104,28 @@ export class SlugModel {
     this.root.scale.setScalar(scale);
   }
 
+  /** Turn it into a snail (or back): golden shell on its back, snail skin, longer neck and eye stalks. */
   setShell(on: boolean): void {
     if (on && !this.shell) {
       const coil = shellMesh();
-      coil.rotation.y = Math.PI / 2; // coiled side-on, like a real snail's…
+      // Coiled side-on, like a real snail's, spun so the opening faces down onto the body
+      // (the coil ends 0.3 of a turn round, i.e. 108°; turn that to point straight down).
+      coil.rotation.set(0, Math.PI / 2, -THREE.MathUtils.degToRad(108 + 90));
       this.shell = new THREE.Group();
       this.shell.add(coil);
-      this.shell.rotation.z = 0.85; // …tipped towards the camera so the spiral shows from above
-      this.shell.position.set(0, 0.38, 0.04);
-      this.shell.scale.setScalar(1.25);
+      this.shell.rotation.z = 0.35; // tipped a little towards the camera so the spiral shows from above
+      this.shell.position.set(0, 0.38, 0.08);
+      this.shell.scale.setScalar(1.55);
       this.body.add(this.shell);
     }
-    if (this.shell) this.shell.visible = on;
+    if (!this.shell) return;
+    if (this.shell.visible === on && this.colors === (on ? SNAIL_COLORS : this.slugColors)) return;
+    this.shell.visible = on;
+    this.colors = on ? SNAIL_COLORS : this.slugColors;
+    this.footMat.color.setHex(this.colors.foot);
+    for (const o of this.slugBits) o.visible = !on;
+    this.tube.scale.set(on ? 0.9 : 1, 0.72, on ? 1.18 : 1); // a slimmer, longer body: neck out front, tail behind
+    for (const st of this.stalks) st.scale.set(1, on ? 1.45 : 1, 1); // tall eye stalks
   }
 
   update(p: SlugPose, dt: number, time: number): void {
@@ -154,6 +175,18 @@ export class SlugModel {
       });
       this.mouth.visible = true; // screaming
       this.mouth.scale.set(1, 0.7 + Math.abs(wriggle) * 0.3, 0.55);
+    } else if (p.mode === 'cheer') {
+      // Champion: reared up proud, beaming, eye stalks waving, bouncing for joy.
+      const up = Math.min(1, p.t / 0.4);
+      b.rotation.x = 0.7 * up;
+      b.position.y = 0.06 * up + Math.abs(Math.sin(time * 6)) * 0.05;
+      this.mouth.visible = true;
+      this.mouth.scale.set(1.4, 0.45, 0.55); // a big grin
+      this.stalks.forEach((st, i) => {
+        st.rotation.x = -0.1 + Math.sin(time * 8 + i * 2) * 0.3;
+        st.rotation.z = (i ? 1 : -1) * (0.55 + Math.sin(time * 7 + i) * 0.25);
+      });
+      this.mat.clearcoat = 1;
     } else if (p.mode === 'munch') {
       // Rear up to face the camera, mouth chomping away, eyes waggling with joy.
       const up = Math.min(1, p.t / 0.25) * Math.min(1, (MUNCH_TIME - p.t) / 0.3);
